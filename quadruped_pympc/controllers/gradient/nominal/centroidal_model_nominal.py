@@ -144,6 +144,7 @@ class Centroidal_Model_Nominal:
         self.inertia = cs.SX.sym("inertia", 9, 1)
         self.mass = cs.SX.sym("mass", 1, 1)
 
+
         # Not so useful, i can instantiate a casadi function for the fd
         param = cs.vertcat(
             self.stance_param,

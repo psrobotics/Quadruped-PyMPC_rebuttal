@@ -6,7 +6,7 @@ from quadruped_pympc.helpers.quadruped_utils import GaitType
 
 # These are used both for a real experiment and a simulation -----------
 # These are the only attributes needed per quadruped, the rest can be computed automatically ----------------------
-robot = 'aliengo'  # 'go1', 'go2', 'b2', 'aliengo', 'hyqreal', 'mini_cheetah'  # TODO: Load from robot_descriptions.py
+robot = 'go1'  # 'go1', 'go2', 'b2', 'aliengo', 'hyqreal', 'mini_cheetah'  # TODO: Load from robot_descriptions.py
 
 from gym_quadruped.robot_cfgs import RobotConfig, get_robot_config
 robot_cfg: RobotConfig = get_robot_config(robot_name=robot)
@@ -67,7 +67,7 @@ mpc_params = {
 
     # horizon is the number of timesteps in the future that the mpc will optimize
     # dt is the discretization time used in the mpc
-    'horizon':                                 12,
+    'horizon':                                 24,
     'dt':                                      0.02,
 
     # GRF limits for each single leg
@@ -115,7 +115,7 @@ mpc_params = {
 
     # This will force to use DDP instead of SQP, based on https://arxiv.org/abs/2403.10115.
     # Note that RTI is not compatible with DDP, and no state costraints for now are considered
-    'use_DDP':                                 False,
+    'use_DDP':                                 True,
 
     # this is used only in the case 'use_RTI' is false in a single mpc feedback loop.
     # More is better, but slower computation!
@@ -176,7 +176,7 @@ mpc_params = {
 # -----------------------------------------------------------------------
 
 simulation_params = {
-    'swing_generator':             'scipy',  # 'scipy', 'explicit'
+    'swing_generator':             'scipy',  # 'scipy', 'explicit', 'ndcurves'
     'swing_position_gain_fb':      500,
     'swing_velocity_gain_fb':      10,
     'impedence_joint_position_gain':  10.0,

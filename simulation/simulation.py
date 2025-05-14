@@ -10,9 +10,9 @@ from pprint import pprint
 import numpy as np
 
 # Gym and Simulation related imports
-from gym_quadruped.quadruped_env import QuadrupedEnv
-from gym_quadruped.utils.mujoco.visual import render_sphere, render_vector
-from gym_quadruped.utils.quadruped_utils import LegsAttr
+from quadruped_pympc.gym_quadruped_mod.quadruped_env import QuadrupedEnv
+from quadruped_pympc.gym_quadruped_mod.utils.mujoco.visual import render_sphere, render_vector
+from quadruped_pympc.gym_quadruped_mod.utils.quadruped_utils import LegsAttr
 from tqdm import tqdm
 
 # Helper functions for plotting
@@ -30,7 +30,8 @@ def run_simulation(
     ref_base_lin_vel=(0.0, 4.0),
     ref_base_ang_vel=(-0.4, 0.4),
     friction_coeff=(0.5, 1.0),
-    base_vel_command_type="human",
+    # some random disurtance to help mpc reach target
+    base_vel_command_type="forward",
     seed=0,
     render=True,
     recording_path: PathLike = None,
@@ -42,7 +43,7 @@ def run_simulation(
     hip_height = qpympc_cfg.hip_height
     robot_leg_joints = qpympc_cfg.robot_leg_joints
     robot_feet_geom_names = qpympc_cfg.robot_feet_geom_names
-    scene_name = qpympc_cfg.simulation_params["scene"]
+    scene_name = "paper_comp_nonfriction"
     simulation_dt = qpympc_cfg.simulation_params["dt"]
 
     # Save all observables available.
@@ -165,7 +166,6 @@ def run_simulation(
         for _ in tqdm(range(N_STEPS_PER_EPISODE), desc=f"Ep:{episode_num:d}-steps:", total=N_STEPS_PER_EPISODE):
             # Update value from SE or Simulator ----------------------
             feet_pos = env.feet_pos(frame="world")
-            feet_vel = env.feet_vel(frame='world')
             hip_pos = env.hip_positions(frame="world")
             base_lin_vel = env.base_lin_vel(frame="world")
             base_ang_vel = env.base_ang_vel(frame="world")
@@ -173,8 +173,15 @@ def run_simulation(
             base_pos = env.base_pos
             com_pos = env.com
 
+            ## debug printout
+            print(base_pos)
+
             # Get the reference base velocity in the world frame
             ref_base_lin_vel, ref_base_ang_vel = env.target_base_vel()
+            # target velocity setup
+            #ref_base_lin_vel = np.array([0.5,0.0,0.0])
+            #ref_base_ang_vel = np.array([0.0,0.0,0.0])
+
 
             # Get the inertia matrix
             if qpympc_cfg.simulation_params["use_inertia_recomputation"]:
@@ -197,6 +204,9 @@ def run_simulation(
             # Compute feet jacobians
             feet_jac = env.feet_jacobians(frame='world', return_rot_jac=False)
             feet_jac_dot = env.feet_jacobians_dot(frame='world', return_rot_jac=False)
+
+            # Compute feet velocities
+            feet_vel = LegsAttr(**{leg_name: feet_jac[leg_name] @ env.mjData.qvel for leg_name in legs_order})
 
             # Quadruped PyMPC controller --------------------------------------------------------------
             tau = quadrupedpympc_wrapper.compute_actions(
@@ -312,7 +322,8 @@ def run_simulation(
                 last_render_time = time.time()
 
             # Reset the environment if the episode is terminated ------------------------------------------------
-            if env.step_num >= N_STEPS_PER_EPISODE or is_terminated or is_truncated:
+            #if env.step_num >= N_STEPS_PER_EPISODE or is_terminated or is_truncated:
+            if is_terminated or is_truncated:
                 if is_terminated:
                     print("Environment terminated")
                 else:

@@ -16,6 +16,15 @@ import quadruped_pympc.config as config
 
 from .centroidal_model_nominal import Centroidal_Model_Nominal
 
+# sdf map utils
+from .sdf_map.sdf_casadi import CasadiSDFEnvironment
+from .sdf_map.sdf_casadi import Environment
+from .sdf_map.sdf_casadi import BoxObstacle
+
+
+import os
+import sys
+import pickle
 
 # Class for the Acados NMPC, the model is in another file!
 class Acados_NMPC_Nominal:
@@ -32,8 +41,10 @@ class Acados_NMPC_Nominal:
         self.use_zmp_stability = config.mpc_params["use_zmp_stability"]
         self.use_stability_constraints = self.use_static_stability or self.use_zmp_stability
 
-        self.use_DDP = config.mpc_params["use_DDP"]
+        # sdf
+        self.use_sdf_constraints = True
 
+        self.use_DDP = config.mpc_params["use_DDP"]
         self.verbose = config.mpc_params["verbose"]
 
         self.previous_status = -1
@@ -51,6 +62,27 @@ class Acados_NMPC_Nominal:
         acados_model = self.centroidal_model.export_robot_model()
         self.states_dim = acados_model.x.size()[0]
         self.inputs_dim = acados_model.u.size()[0]
+
+        ## here use casadi map grid setup!
+        if self.use_sdf_constraints:
+            # init obstacles sets
+            obstacle_height = 1
+            # add walls
+            wall_1 = BoxObstacle(center=[-2, 0], angle=np.pi/2, length=10, width=0.1, height=obstacle_height, name="W1")
+            wall_2 = BoxObstacle(center=[12, 0], angle=np.pi/2, length=10, width=0.1, height=obstacle_height, name="W2")
+            wall_3 = BoxObstacle(center=[5, -5], angle=0, length=14, width=0.1, height=obstacle_height, name="W3")
+            wall_4 = BoxObstacle(center=[5, 5], angle=0, length=14, width=0.1, height=obstacle_height, name="W4")
+            # add box obst
+            obst_1 = BoxObstacle(center=[5.5, -2], angle=np.pi/2, length=6, width=0.1, height=obstacle_height, name = "OBST1")
+            obst_2 = BoxObstacle(center=[8.5, 5], angle=np.pi/2, length=6, width=0.1, height=obstacle_height, name = "OBST2")
+            my_obstacles = [wall_1, wall_2, wall_3, wall_4, obst_1, obst_2]
+
+            # Create the Python environment instance
+            python_env = Environment(obstacles=my_obstacles, name="TestEnv")
+            # Create the CasADi Symbolic SDF Environment from it
+            self.symbolic_sdf_wrapper = CasadiSDFEnvironment(python_environment=python_env, name="TestCasadiEnv")
+            self.casadi_sdf_for_nmpc = self.symbolic_sdf_wrapper.get_casadi_sdf()
+
 
         # Create the acados ocp solver
         self.ocp = self.create_ocp_solver_description(acados_model)
@@ -74,6 +106,15 @@ class Acados_NMPC_Nominal:
             status = self.acados_ocp_solver.solve()
 
             # Set cost, constraints and options
+        
+
+
+    def _get_casadi_sdf_expression_map(self, point_sx_3d): # point_sx_2d is SX sym for [x,y]
+        if self.casadi_sdf_for_nmpc:
+            point_sx_2d = point_sx_3d[0:2]
+            return self.casadi_sdf_for_nmpc(point_sx_2d)
+        # Fallback
+        return cs.SX(1e6)     
 
     def create_ocp_solver_description(self, acados_model) -> AcadosOcp:
         # Create ocp object to formulate the OCP
@@ -81,7 +122,6 @@ class Acados_NMPC_Nominal:
         ocp.model = acados_model
         nx = self.states_dim
         nu = self.inputs_dim
-        ny = nx + nu
 
         # Set dimensions
         ocp.dims.N = self.horizon
@@ -94,9 +134,26 @@ class Acados_NMPC_Nominal:
         ny = nx + nu
         ny_e = nx
 
-        ocp.cost.W_e = Q_mat
-        ocp.cost.W = scipy.linalg.block_diag(Q_mat, R_mat)
+        # Build repulsive cost term (one obstacle, CoM only), using sdf map
+        x = ocp.model.x
+        u = ocp.model.u
+        origin = self.centroidal_model.base_position
+        #h_expr = self._get_casadi_sdf_expression( x[0:3] + origin )
+        h_expr = self._get_casadi_sdf_expression_map( x[0:3] + origin )
+        eps    = 1e-2
+        w_rep  = 10
+        rep_expr = w_rep / (h_expr + eps)
 
+        TARGET = np.array([11.0, 0.0])
+
+        ocp.cost.W_e = scipy.linalg.block_diag(Q_mat,
+                                               np.diag([3.0, 3.0]))
+        ocp.cost.W = scipy.linalg.block_diag(Q_mat,
+                                             R_mat,
+                                             np.array([1.0]),
+                                             np.diag([12.0, 12.0]))
+
+        # If not using ddp, add sdf cost here
         ocp.cost.Vx = np.zeros((ny, nx))
         ocp.cost.Vx[:nx, :nx] = np.eye(nx)
 
@@ -106,8 +163,8 @@ class Acados_NMPC_Nominal:
 
         ocp.cost.Vx_e = np.eye(nx)
 
-        ocp.cost.yref = np.zeros((ny,))
-        ocp.cost.yref_e = np.zeros((ny_e,))
+        ocp.cost.yref = np.zeros((ny + 1 + 2,)) # add sdf term, using sdf
+        ocp.cost.yref_e = np.zeros((ny_e + 2,))
 
         # Set friction and foothold constraints
         expr_h_friction, self.constr_uh_friction, self.constr_lh_friction = self.create_friction_cone_constraints()
@@ -142,7 +199,42 @@ class Acados_NMPC_Nominal:
             nsh += expr_h_support_polygon.shape[0]
             self.nsh_stability_end = copy.copy(nsh)
 
+
+        # ---- NEW: Add SDF Constraints ----
+        if self.use_sdf_constraints:
+            pass
+            #sdf_safety_magin_tmp = 0.1
+
+            #self.nsh_sdf_start = copy.copy(nsh) # For potential slack variables
+            #expr_h_sdf_list = []
+            
+            # Get the symbolic parameter for the MPC window's origin in the world frame
+            #mpc_window_origin_w = self.centroidal_model.base_position # This is p[9:12]
+
+            # 1. CoM / Base SDF constraint
+            #com_pos_scaled = self.centroidal_model.states[0:3]
+            #com_pos_world = com_pos_scaled + mpc_window_origin_w
+            #sdf_com_expr = self._get_casadi_sdf_expression(com_pos_world)
+            #expr_h_sdf_list.append(sdf_com_expr)
+
+            #self.expr_h_sdf = cs.vertcat(*expr_h_sdf_list) # Vertically stack all symbolic expressions
+            #num_sdf_total_constraints = self.expr_h_sdf.shape[0] # THIS IS THE CORRECT TOTAL COUNT
+
+            # Default bounds (lower bound is safety margin, upper is infinity)
+            # These will be dynamically adjusted for feet in contact phase.
+            #self.constr_lh_sdf = np.full(num_sdf_total_constraints, sdf_safety_magin_tmp)
+            #self.constr_uh_sdf = np.full(num_sdf_total_constraints, ACADOS_INFTY)
+
+            #nsh += num_sdf_total_constraints
+            #self.nsh_sdf_end = copy.copy(nsh)
+        # ---- END SDF Constraints ----
+
+            #ocp.model.con_h_expr = cs.vertcat(ocp.model.con_h_expr, self.expr_h_sdf)
+            #ocp.constraints.uh = np.concatenate((ocp.constraints.uh, self.constr_uh_sdf))
+            #ocp.constraints.lh = np.concatenate((ocp.constraints.lh, self.constr_lh_sdf))
+
         nsh_state_constraint_end = copy.copy(nsh)
+
 
         # Set slack variable configuration:
         num_state_cstr = nsh_state_constraint_end - nsh_state_constraint_start
@@ -211,8 +303,12 @@ class Acados_NMPC_Nominal:
 
             ocp.cost.cost_type = "NONLINEAR_LS"
             ocp.cost.cost_type_e = "NONLINEAR_LS"
-            ocp.model.cost_y_expr = cs.vertcat(ocp.model.x, ocp.model.u)
-            ocp.model.cost_y_expr_e = ocp.model.x
+            ocp.model.cost_y_expr = cs.vertcat(ocp.model.x,
+                                               ocp.model.u,
+                                               rep_expr,
+                                               ocp.model.x[0:2] - cs.DM(TARGET))
+            ocp.model.cost_y_expr_e = cs.vertcat(ocp.model.x,
+                                                 ocp.model.x[0:2] - cs.DM(TARGET))
 
             ocp.translate_to_feasibility_problem(keep_x0=True, keep_cost=True)
 
@@ -500,11 +596,14 @@ class Acados_NMPC_Nominal:
 
     def set_weight(self, nx, nu):
         # Define the weight matrices for the cost function
+        # Modified velocity
 
         Q_position = np.array([0, 0, 1500])  # x, y, z
-        Q_velocity = np.array([200, 200, 200])  # x_vel, y_vel, z_vel
+        #Q_velocity = np.array([200, 200, 200])  # x_vel, y_vel, z_vel
+        Q_velocity = np.array([3, 3, 200])  # x_vel, y_vel, z_vel
         Q_base_angle = np.array([500, 500, 0])  # roll, pitch, yaw
-        Q_base_angle_rates = np.array([20, 20, 50])  # roll_rate, pitch_rate, yaw_rate
+        #Q_base_angle_rates = np.array([20, 20, 50])  # roll_rate, pitch_rate, yaw_rate
+        Q_base_angle_rates = np.array([10, 10, 3])  # roll_rate, pitch_rate, yaw_rate
         Q_foot_pos = np.array([300, 300, 300])  # f_x, f_y, f_z (should be 4 times this, once per foot)
         Q_com_position_z_integral = np.array([50])  # integral of z_com
         Q_com_velocity_x_integral = np.array([10])  # integral of x_com
@@ -1039,6 +1138,7 @@ class Acados_NMPC_Nominal:
                         if idx_constraint[3] < up_constraint_RR.shape[0] - 1:
                             idx_constraint[3] += 1
 
+
         except:
             if self.verbose:
                 print("###WARNING: error in setting the constraints")
@@ -1222,7 +1322,8 @@ class Acados_NMPC_Nominal:
                 self.acados_ocp_solver.set(j, "yref", yref)
 
         # Fill last step horizon reference (self.states_dim - no control action!!)
-        yref_N = np.zeros(shape=(self.states_dim,))
+        # also add 2 - dim to goal cost
+        yref_N = np.zeros(shape=(self.states_dim + 2,))
         yref_N[0:3] = reference["ref_position"]
         yref_N[3:6] = reference["ref_linear_velocity"]
         yref_N[6:9] = reference["ref_orientation"]
@@ -1280,6 +1381,7 @@ class Acados_NMPC_Nominal:
                     if RR_contact_sequence[j + 1] == 0 and RR_contact_sequence[j + 2] == 1:
                         stance_proximity_RR[j] = 1 * 0
 
+
         # Set the parameters to  acados
         for j in range(self.horizon):
             # If we have estimated an external wrench, we can compensate it for all steps
@@ -1305,9 +1407,12 @@ class Acados_NMPC_Nominal:
                     stance_proximity_FR[j],
                     stance_proximity_RL[j],
                     stance_proximity_RR[j],
-                    state["position"][0],
-                    state["position"][1],
-                    state["position"][2],
+                    #state["position"][0],
+                    #state["position"][1],
+                    #state["position"][2],
+                    self.initial_base_position[0], # Use the stored true world offset
+                    self.initial_base_position[1], # Use the stored true world offset
+                    self.initial_base_position[2], # Use the stored true world offset
                     state["orientation"][2],
                     external_wrenches_estimated_param[0],
                     external_wrenches_estimated_param[1],
