@@ -21,12 +21,21 @@ from quadruped_pympc.helpers.quadruped_utils import plot_swing_mujoco
 # PyMPC controller imports
 from quadruped_pympc.quadruped_pympc_wrapper import QuadrupedPyMPC_Wrapper
 
+import imageio
+import mujoco
+from PIL import Image
+import os
+import glfw
+
+GLOBAL_REACH_COUNTER = 0
+GLOBAL_COLLISION_COUNTER = 0
+GLOBAL_TIMEOUT_COUNTER = 0
 
 def run_simulation(
     qpympc_cfg,
     process=0,
     num_episodes=500,
-    num_seconds_per_episode=60,
+    num_seconds_per_episode=240,
     ref_base_lin_vel=(0.0, 4.0),
     ref_base_ang_vel=(-0.4, 0.4),
     friction_coeff=(0.5, 1.0),
@@ -36,6 +45,9 @@ def run_simulation(
     render=True,
     recording_path: PathLike = None,
 ):
+
+    global GLOBAL_TIMEOUT_COUNTER, GLOBAL_COLLISION_COUNTER, GLOBAL_REACH_COUNTER
+
     np.set_printoptions(precision=3, suppress=True)
     np.random.seed(seed)
 
@@ -43,7 +55,7 @@ def run_simulation(
     hip_height = qpympc_cfg.hip_height
     robot_leg_joints = qpympc_cfg.robot_leg_joints
     robot_feet_geom_names = qpympc_cfg.robot_feet_geom_names
-    scene_name = "paper_comp_nonfriction"
+    scene_name = qpympc_cfg.scene_name
     simulation_dt = qpympc_cfg.simulation_params["dt"]
 
     # Save all observables available.
@@ -138,12 +150,10 @@ def run_simulation(
         from gym_quadruped.utils.data.h5py import H5Writer
 
         root_path = pathlib.Path(recording_path)
-        root_path.mkdir(exist_ok=True)
+        root_path.mkdir(parents=True, exist_ok=True)
         dataset_path = (
             root_path
-            / f"{robot_name}/{scene_name}"
-            / f"lin_vel={ref_base_lin_vel} ang_vel={ref_base_ang_vel} friction={friction_coeff}"
-            / f"ep={num_episodes}_steps={int(num_seconds_per_episode // simulation_dt):d}.h5"
+            / "log.h5"
         )
         h5py_writer = H5Writer(
             file_path=dataset_path,
@@ -151,14 +161,20 @@ def run_simulation(
             extra_obs=None,  # TODO: Make this automatically configured. Not hardcoded
         )
         print(f"\n Recording data to: {dataset_path.absolute()}")
+
+        # set up an offscreen renderer
+        pixels = []
+        frame_idx = 0
     else:
         h5py_writer = None
 
     # -----------------------------------------------------------------------------------------------------------
     RENDER_FREQ = 30  # Hz
+    RENDER_SAVE_FREQ = 2  # Hz
     N_EPISODES = num_episodes
     N_STEPS_PER_EPISODE = int(num_seconds_per_episode // simulation_dt)
     last_render_time = time.time()
+    last_render_save_time = time.time()
 
     state_obs_history, ctrl_state_history = [], []
     for episode_num in range(N_EPISODES):
@@ -254,7 +270,7 @@ def run_simulation(
             # action += action_noise
 
             # Apply the action to the environment and evolve sim --------------------------------------------------
-            state, reward, is_terminated, is_truncated, info = env.step(action=action)
+            state, reward, is_terminated, is_truncated, is_reach_target, info = env.step(action=action)
 
             # Get Controller state observables
             ctrl_state = quadrupedpympc_wrapper.get_obs()
@@ -271,74 +287,49 @@ def run_simulation(
             if render and (time.time() - last_render_time > 1.0 / RENDER_FREQ or env.step_num == 1):
                 _, _, feet_GRF = env.feet_contact_state(ground_reaction_forces=True)
 
-                # Plot the swing trajectory
-                feet_traj_geom_ids = plot_swing_mujoco(
-                    viewer=env.viewer,
-                    swing_traj_controller=quadrupedpympc_wrapper.wb_interface.stc,
-                    swing_period=quadrupedpympc_wrapper.wb_interface.stc.swing_period,
-                    swing_time=LegsAttr(
-                        FL=ctrl_state["swing_time"][0],
-                        FR=ctrl_state["swing_time"][1],
-                        RL=ctrl_state["swing_time"][2],
-                        RR=ctrl_state["swing_time"][3],
-                    ),
-                    lift_off_positions=ctrl_state["lift_off_positions"],
-                    nmpc_footholds=ctrl_state["nmpc_footholds"],
-                    ref_feet_pos=ctrl_state["ref_feet_pos"],
-                    early_stance_detector=quadrupedpympc_wrapper.wb_interface.esd,
-                    geom_ids=feet_traj_geom_ids,
-                )
-
-                # Update and Plot the heightmap
-                if qpympc_cfg.simulation_params["visual_foothold_adaptation"] != "blind":
-                    # if(stc.check_apex_condition(current_contact, interval=0.01)):
-                    for leg_id, leg_name in enumerate(legs_order):
-                        data = heightmaps[
-                            leg_name
-                        ].data  # .update_height_map(ref_feet_pos[leg_name], yaw=env.base_ori_euler_xyz[2])
-                        if data is not None:
-                            for i in range(data.shape[0]):
-                                for j in range(data.shape[1]):
-                                    heightmaps[leg_name].geom_ids[i, j] = render_sphere(
-                                        viewer=env.viewer,
-                                        position=([data[i][j][0][0], data[i][j][0][1], data[i][j][0][2]]),
-                                        diameter=0.01,
-                                        color=[0, 1, 0, 0.5],
-                                        geom_id=heightmaps[leg_name].geom_ids[i, j],
-                                    )
-
-                # Plot the GRF
-                for leg_id, leg_name in enumerate(legs_order):
-                    feet_GRF_geom_ids[leg_name] = render_vector(
-                        env.viewer,
-                        vector=feet_GRF[leg_name],
-                        pos=feet_pos[leg_name],
-                        scale=np.linalg.norm(feet_GRF[leg_name]) * 0.005,
-                        color=np.array([0, 1, 0, 0.5]),
-                        geom_id=feet_GRF_geom_ids[leg_name],
-                    )
-
-                env.render()
+                #env.render(mode="human")
                 last_render_time = time.time()
+
+            if recording_path is not None and (time.time() - last_render_save_time > 1.0 / RENDER_SAVE_FREQ or env.step_num == 1):
+                rgb = env.render(mode="rgb_array")
+                fname = os.path.join(recording_path, "render/"+f"{frame_idx:03d}.png")
+                imageio.imsave(str(fname), rgb)
+
+                frame_idx += 1
+                last_render_save_time = time.time()
+
+            if h5py_writer is not None:  # Save episode trajectory data to disk.
+                obs_dict = state
+                h5py_writer.append_trajectory(state_obs_traj=collate_obs([obs_dict]),
+                                              time=np.array([[env.simulation_time]]))
 
             # Reset the environment if the episode is terminated ------------------------------------------------
             #if env.step_num >= N_STEPS_PER_EPISODE or is_terminated or is_truncated:
+            if env.step_num >= N_STEPS_PER_EPISODE:
+                GLOBAL_TIMEOUT_COUNTER += 1
+                print("SIM_FAIL_TIMEOUT")
+                return
             if is_terminated or is_truncated:
-                if is_terminated:
-                    print("Environment terminated")
-                else:
-                    state_obs_history.append(ep_state_history)
-                    ctrl_state_history.append(ep_ctrl_state_history)     
+                GLOBAL_COLLISION_COUNTER += 1
+                print("SIM_FAIL_COLLOSION")
+                return
+                #if is_terminated:
+                #    print("Environment terminated")
+                #else:
+                #state_obs_history.append(ep_state_history)
+                #ctrl_state_history.append(ep_ctrl_state_history)     
 
-                env.reset(random=True)
-                quadrupedpympc_wrapper.reset(initial_feet_pos=env.feet_pos(frame="world"))
-
-        if h5py_writer is not None:  # Save episode trajectory data to disk.
-            ep_obs_history = collate_obs(ep_state_history)  # | collate_obs(ep_ctrl_state_history)
-            ep_traj_time = np.asarray(ep_time)[:, np.newaxis]
-            h5py_writer.append_trajectory(state_obs_traj=ep_obs_history, time=ep_traj_time)
+                #env.reset(random=True)
+                #quadrupedpympc_wrapper.reset(initial_feet_pos=env.feet_pos(frame="world"))
+            if is_reach_target:
+                GLOBAL_REACH_COUNTER += 1
+                print("SIM_REACH_TARGET")
+                print(env.step_num * simulation_dt)
+                return
 
     env.close()
+
+
     if h5py_writer is not None:
         return h5py_writer.file_path
 
@@ -366,7 +357,33 @@ if __name__ == "__main__":
     # Custom changes to the config here:
     pass
 
+    GLOBAL_TIMEOUT_COUNTER   = 0
+    GLOBAL_COLLISION_COUNTER = 0
+    GLOBAL_REACH_COUNTER     = 0
+
+    # bached sim
+    qpympc_cfg.scene_name = "paper_comp_nonfriction"
+    base_dir = "/Users/shuangpeng/Desktop/Quadruped-PyMPC/simulation/test_save/nonfriction_lt"
+    os.makedirs(base_dir, exist_ok=True)
+
+
+    for run_idx in range(1, 2):
+
+        run_dir = os.path.join(base_dir, str(run_idx))
+        os.makedirs(run_dir, exist_ok=True)
+        render_dir = os.path.join(run_dir, "render")
+        os.makedirs(render_dir, exist_ok=True)
+
+        print(f"Starting run {run_idx} → saving in {run_dir}")
+        run_simulation(
+            qpympc_cfg=qpympc_cfg,
+            recording_path=run_dir,
+        )
+        print(GLOBAL_TIMEOUT_COUNTER)
+        print(GLOBAL_COLLISION_COUNTER)
+        print(GLOBAL_REACH_COUNTER)
+
     # Run the simulation with the desired configuration.....
-    run_simulation(qpympc_cfg=qpympc_cfg)
+    #run_simulation(qpympc_cfg=qpympc_cfg, recording_path = save_path)
 
     # run_simulation(num_episodes=1, render=False)

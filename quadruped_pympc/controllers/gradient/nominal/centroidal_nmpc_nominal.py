@@ -73,8 +73,8 @@ class Acados_NMPC_Nominal:
             wall_3 = BoxObstacle(center=[5, -5], angle=0, length=14, width=0.1, height=obstacle_height, name="W3")
             wall_4 = BoxObstacle(center=[5, 5], angle=0, length=14, width=0.1, height=obstacle_height, name="W4")
             # add box obst
-            obst_1 = BoxObstacle(center=[5.5, -2], angle=np.pi/2, length=6, width=0.1, height=obstacle_height, name = "OBST1")
-            obst_2 = BoxObstacle(center=[8.5, 5], angle=np.pi/2, length=6, width=0.1, height=obstacle_height, name = "OBST2")
+            obst_1 = BoxObstacle(center=[5.5, -2.0], angle=np.pi/2, length=6, width=0.1, height=obstacle_height, name = "OBST1")
+            obst_2 = BoxObstacle(center=[8.5, 2.0], angle=np.pi/2, length=6, width=0.1, height=obstacle_height, name = "OBST2")
             my_obstacles = [wall_1, wall_2, wall_3, wall_4, obst_1, obst_2]
 
             # Create the Python environment instance
@@ -147,11 +147,11 @@ class Acados_NMPC_Nominal:
         TARGET = np.array([11.0, 0.0])
 
         ocp.cost.W_e = scipy.linalg.block_diag(Q_mat,
-                                               np.diag([3.0, 3.0]))
+                                               np.diag([4.0, 4.0])) #4
         ocp.cost.W = scipy.linalg.block_diag(Q_mat,
                                              R_mat,
                                              np.array([1.0]),
-                                             np.diag([12.0, 12.0]))
+                                             np.diag([13.0, 13.0])) #13
 
         # If not using ddp, add sdf cost here
         ocp.cost.Vx = np.zeros((ny, nx))

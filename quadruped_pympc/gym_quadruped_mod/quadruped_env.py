@@ -131,6 +131,7 @@ class QuadrupedEnv(gym.Env):
         super(QuadrupedEnv, self).__init__()
         log.info(f'Initializing {robot} environment with scene {scene}.')
 
+
         # Store all initialization arguments in a dictionary. Useful if we want to reconstruct this environment.
         self._save_hyperparameters(constructor_params=locals().copy())
         self.robot_name = robot
@@ -158,6 +159,10 @@ class QuadrupedEnv(gym.Env):
         scene_env = base_scene_env_path
         self.terrain_limits = (10000, -10000, 10000, -10000)
 
+        # --- Crucial Initializations for Rendering ---
+        self._offscreen_renderer = None # Initialize to None, will be created lazily
+        self._render_width = 1920
+        self._render_height = 1080
 
         # Define the robot model to load to the scene ________________________________________________________
         try:  # to load the robot's model on custom terrain scene.
@@ -281,6 +286,7 @@ class QuadrupedEnv(gym.Env):
         # Check if done (simplified, usually more complex)
         invalid_contact, contact_info = self._check_for_invalid_contacts()
         out_of_terrain_bounds = self._check_out_of_terrain_bounds()
+        reach_target = self._check_reach_target()
         is_terminated = invalid_contact or out_of_terrain_bounds  # and ...
         is_truncated = False
         # Info dictionary
@@ -294,7 +300,7 @@ class QuadrupedEnv(gym.Env):
                 self._sample_ref_vel()
 
 
-        return obs, reward, is_terminated, is_truncated, info
+        return obs, reward, is_terminated, is_truncated, reach_target, info
 
     def reset(
         self,
@@ -408,70 +414,98 @@ class QuadrupedEnv(gym.Env):
             ghost_alpha: (float) or (n_robot,) array of alpha value of the ghost robots.
 
         """
-        if self.viewer is None and mode == 'human':
-            self.viewer = mujoco.viewer.launch_passive(
-                self.mjModel,
-                self.mjData,
-                show_left_ui=False,
-                show_right_ui=False,
-                key_callback=lambda x: self._key_callback(x),
+        
+        if False:
+            #if self.viewer is None and mode == 'human':
+            if self.viewer is None:
+                self.viewer = mujoco.viewer.launch_passive(
+                    self.mjModel,
+                    self.mjData,
+                    show_left_ui=False,
+                    show_right_ui=False,
+                    key_callback=lambda x: self._key_callback(x),
+                )
+                if tint_robot:
+                    change_robot_appearance(self.mjModel, alpha=1.0)
+
+                mujoco.mjv_defaultFreeCamera(self.mjModel, self.viewer.cam)
+                self.viewer.user_scn.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 0
+                self.viewer.user_scn.flags[mujoco.mjtRndFlag.mjRND_REFLECTION] = 0
+
+            # Define/Update markers for visualization of desired and current base velocity _______________________________
+            X_B = self.base_configuration
+            base_pos = X_B[:3, 3]
+            base_lin_vel = self.mjData.qvel[0:3]
+            ref_base_lin_vel_B, _ = self.target_base_vel()
+            ref_vec_pos, vec_pos = base_pos + [0, 0, 0.1], base_pos + [0, 0, 0.15]
+            ref_vel_vec_color, vel_vec_color = np.array([1, 0.5, 0, 0.7]), np.array([0, 1, 1, 0.7])
+            ref_vec_scale, vec_scale = (
+                np.linalg.norm(ref_base_lin_vel_B) / 1.0,
+                np.linalg.norm(base_lin_vel) / 1.0,
             )
-            if tint_robot:
-                change_robot_appearance(self.mjModel, alpha=1.0)
 
-            mujoco.mjv_defaultFreeCamera(self.mjModel, self.viewer.cam)
-            self.viewer.user_scn.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 0
-            self.viewer.user_scn.flags[mujoco.mjtRndFlag.mjRND_REFLECTION] = 0
+            ref_vec_id, vec_id = (
+                self._geom_ids.get('ref_dr_B_vec', -1),
+                self._geom_ids.get('dr_B_vec', -1),
+            )
+            self._geom_ids['ref_dr_B_vec'] = render_vector(
+                self.viewer,
+                ref_base_lin_vel_B,
+                pos=ref_vec_pos,
+                scale=ref_vec_scale,
+                color=ref_vel_vec_color,
+                geom_id=ref_vec_id,
+            )
+            self._geom_ids['dr_B_vec'] = render_vector(
+                self.viewer,
+                base_lin_vel,
+                pos=vec_pos,
+                scale=vec_scale,
+                color=vel_vec_color,
+                geom_id=vec_id,
+            )
 
-        # Define/Update markers for visualization of desired and current base velocity _______________________________
-        X_B = self.base_configuration
-        base_pos = X_B[:3, 3]
-        base_lin_vel = self.mjData.qvel[0:3]
-        ref_base_lin_vel_B, _ = self.target_base_vel()
-        ref_vec_pos, vec_pos = base_pos + [0, 0, 0.1], base_pos + [0, 0, 0.15]
-        ref_vel_vec_color, vel_vec_color = np.array([1, 0.5, 0, 0.7]), np.array([0, 1, 1, 0.7])
-        ref_vec_scale, vec_scale = (
-            np.linalg.norm(ref_base_lin_vel_B) / 1.0,
-            np.linalg.norm(base_lin_vel) / 1.0,
-        )
+            # Ghost robot rendering _______________________________________________________________________________________
+            if ghost_qpos is not None:
+                self._render_ghost_robots(qpos=ghost_qpos, alpha=ghost_alpha)
 
-        ref_vec_id, vec_id = (
-            self._geom_ids.get('ref_dr_B_vec', -1),
-            self._geom_ids.get('dr_B_vec', -1),
-        )
-        self._geom_ids['ref_dr_B_vec'] = render_vector(
-            self.viewer,
-            ref_base_lin_vel_B,
-            pos=ref_vec_pos,
-            scale=ref_vec_scale,
-            color=ref_vel_vec_color,
-            geom_id=ref_vec_id,
-        )
-        self._geom_ids['dr_B_vec'] = render_vector(
-            self.viewer,
-            base_lin_vel,
-            pos=vec_pos,
-            scale=vec_scale,
-            color=vel_vec_color,
-            geom_id=vec_id,
-        )
+            # Update the camera position. _________________________________________________________________________________
+            #cam_pos = max(self.robot_cfg.hip_height * 0.1, base_pos[2])
+            #self._update_camera_target(self.viewer.cam, np.concatenate((base_pos[:2], [cam_pos])))
 
-        # Ghost robot rendering _______________________________________________________________________________________
-        if ghost_qpos is not None:
-            self._render_ghost_robots(qpos=ghost_qpos, alpha=ghost_alpha)
+            # before the main loop, we just force set the freecam here for visualization
+            self.viewer.cam.azimuth   = 90      # compass heading 
+            self.viewer.cam.elevation = -90    # straight down
+            self.viewer.cam.lookat    = np.array([5.0, 0.0, 0.0])  # point at floor center
+            self.viewer.cam.distance  = 15.0   # how far back/up the camera sits
 
-        # Update the camera position. _________________________________________________________________________________
-        #cam_pos = max(self.robot_cfg.hip_height * 0.1, base_pos[2])
-        #self._update_camera_target(self.viewer.cam, np.concatenate((base_pos[:2], [cam_pos])))
+            # Finally, sync the viewer with the data. # TODO: if render mode is rgb, return the frame.
+            self.viewer.sync()
 
-        # before the main loop:
-        self.viewer.cam.azimuth   = 90      # compass heading 
-        self.viewer.cam.elevation = -90    # straight down
-        self.viewer.cam.lookat    = np.array([5.0, 0.0, 0.0])  # point at floor center
-        self.viewer.cam.distance  = 15.0   # how far back/up the camera sits
+        if mode == 'human':
+            return
+        # --- new: offscreen rgb_array mode ---
+        elif mode == 'rgb_array':
+            # Lazily create offscreen renderer
+            if self._offscreen_renderer is None:
+                try:
+                    self._offscreen_renderer = mujoco.Renderer(self.mjModel, height=2160, width=3840)
+                    print(f"Offscreen renderer initialized ({self._render_width}x{self._render_height}).")
+                except Exception as e:
+                    print(f"Error initializing MuJoCo Renderer: {e}")
+                    return None
 
-        # Finally, sync the viewer with the data. # TODO: if render mode is rgb, return the frame.
-        self.viewer.sync()
+            scene_option = mujoco.MjvOption() 
+            # camera id 0 = top-down camera
+            self._offscreen_renderer.update_scene(self.mjData, camera=0)
+
+            # The render() method of mujoco.Renderer returns the pixels directly
+            img = self._offscreen_renderer.render()
+            # Make a copy to avoid issues with buffer ownership
+            return img[::-1, :, :].copy() 
+        else:
+            raise ValueError(f"Unknown render mode '{mode}'")
+
 
     def target_base_vel(self, frame='world') -> tuple[np.ndarray, np.ndarray]:
         """Returns the target base linear (3,) and angular (3,) velocity in the world reference frame."""
@@ -1173,6 +1207,14 @@ class QuadrupedEnv(gym.Env):
         """Env termination occurs when the robot is outside the environment."""
         return self.base_pos[0] > self.terrain_limits[0] or self.base_pos[0] < self.terrain_limits[1] or self.base_pos[1] > self.terrain_limits[2] or self.base_pos[1] < self.terrain_limits[3]
     
+    def _check_reach_target(self) -> bool:
+        "Check if reach env target"
+        TARGET = np.array([11.0, 0.0])
+        R = 0.5
+        com_xy = np.array([self.base_pos[0], self.base_pos[1]])
+        dist = np.linalg.norm(com_xy - TARGET)
+        return dist <= R
+
     def _get_geom_body_info(self, geom_name: str = None, geom_id: int = None) -> [int, str]:
         """Returns the body ID and name associated with the geometry name or ID."""
         assert geom_name is not None or geom_id is not None, 'Please provide either the geometry name or ID.'
